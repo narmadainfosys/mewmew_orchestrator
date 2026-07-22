@@ -29,6 +29,7 @@ Issues = "https://github.com/narmadainfosys/mewmew_orchestrator/issues"
 
 [project.optional-dependencies]
 yaml = ["PyYAML>=6.0"]
+tui = ["textual>=8.0.0"]
 
 [project.scripts]
 mew = "mewmew_orchestrator.cli:main"

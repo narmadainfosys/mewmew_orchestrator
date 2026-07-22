@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -68,6 +69,26 @@ def find_best_agent(task: str, agents: list[str], config: dict) -> list[str]:
     return [name for _, name in scored]
 
 
+def extract_json(text: str) -> list[dict] | None:
+    text = text.strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    for pattern in [r'```(?:json)?\s*\n(.*?)```', r'(\[.*?\])', r'(\{.*\})']:
+        m = re.search(pattern, text, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group(1))
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return None
+
+
 def run_agent(name: str, prompt: str, config: dict, workdir: str, timeout: int, yolo: bool) -> dict[str, Any]:
     agent = config.get(name)
     if not agent:
@@ -91,17 +112,44 @@ def run_agent(name: str, prompt: str, config: dict, workdir: str, timeout: int, 
     env = os.environ.copy()
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd, cwd=workdir, env=env,
-            capture_output=True, text=True, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, bufsize=1,
         )
+
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+
+        def reader(stream, lines, tag):
+            try:
+                for line in iter(stream.readline, ""):
+                    lines.append(line)
+                    print(f"[{tag}] {line}", end="", flush=True)
+            finally:
+                stream.close()
+
+        t_out = threading.Thread(target=reader, args=(proc.stdout, stdout_lines, name))
+        t_err = threading.Thread(target=reader, args=(proc.stderr, stderr_lines, f"{name}:err"))
+        t_out.start()
+        t_err.start()
+
+        proc.wait(timeout=timeout)
+        t_out.join()
+        t_err.join()
+
         result["status"] = "completed" if proc.returncode == 0 else "failed"
-        result["output"] = proc.stdout
-        result["error"] = proc.stderr
+        result["output"] = "".join(stdout_lines)
+        result["error"] = "".join(stderr_lines)
         result["returncode"] = proc.returncode
+
     except subprocess.TimeoutExpired:
+        proc.kill()
+        t_out.join()
+        t_err.join()
         result["status"] = "timeout"
         result["error"] = f"timed out after {timeout}s"
+        result["output"] = "".join(stdout_lines)
     except Exception as e:
         result["status"] = "error"
         result["error"] = str(e)
@@ -193,6 +241,59 @@ def pipeline_dispatch(steps: list[tuple[str, str]], config: dict, base_dir: str,
 
         if in_git and shutil.which("git"):
             branch = f"mew-pipe-step{i+1}"
+            r = subprocess.run(
+                ["git", "worktree", "add", "-b", branch, step_dir],
+                capture_output=True, text=True, cwd=src,
+            )
+            if r.returncode != 0:
+                shutil.rmtree(step_dir, ignore_errors=True)
+                shutil.copytree(src, step_dir, ignore=shutil.ignore_patterns(".git", "node_modules", ".mew"))
+        else:
+            shutil.copytree(src, step_dir, ignore=shutil.ignore_patterns(".git", "node_modules", ".mew"))
+
+        r = run_agent(agent_name, prompt, config, step_dir, timeout, yolo)
+        results.append(r)
+        context += f"\n--- Step {i+1} ({agent_name}) ---\n{r['output'][:3000]}"
+
+    return results
+
+
+PLANNER_PROMPT = """\
+You are a planner that breaks development tasks into clear sub-tasks and assigns each to the best agent.
+
+Available agents:
+{profiles}
+
+Rules:
+- Each sub-task targets ONE agent — pick the agent whose strengths fit best
+- Order sub-tasks so later steps can build on earlier ones (dependencies first)
+- Keep sub-tasks focused and actionable
+
+Respond with ONLY a valid JSON array. No markdown, no explanation, no code blocks:
+[
+  {{"agent": "<agent_name>", "task": "<concise sub-task description>"}}
+]
+
+Task: {task}"""
+
+
+def plan_dispatch(plan: list[dict], config: dict, base_dir: str, timeout: int, yolo: bool) -> list[dict]:
+    results: list[dict] = []
+    shutil.rmtree(base_dir, ignore_errors=True)
+    Path(base_dir).mkdir(parents=True, exist_ok=True)
+    context = ""
+    src = os.getcwd()
+
+    in_git = subprocess.run(["git", "rev-parse", "--git-dir"], capture_output=True).returncode == 0
+
+    for i, step in enumerate(plan):
+        agent_name = step["agent"]
+        task = step["task"]
+        step_dir = os.path.join(base_dir, f"step-{i+1}-{agent_name}")
+        prompt = f"{task}\n\n<context>\n{context[:3000]}\n</context>" if context else task
+
+        if in_git and shutil.which("git"):
+            branch = f"mew-plan-step{i+1}"
             r = subprocess.run(
                 ["git", "worktree", "add", "-b", branch, step_dir],
                 capture_output=True, text=True, cwd=src,
@@ -313,6 +414,78 @@ def cmd_profile(args: argparse.Namespace, config: dict) -> int:
     return 0
 
 
+@command
+def cmd_plan(args: argparse.Namespace, config: dict) -> int:
+    planner = args.planner
+    available = args.agents or list(config.keys())
+    base_dir = args.dir or os.path.join(os.getcwd(), ".mew")
+
+    agent_lines = []
+    for name in available:
+        info = config[name]
+        desc = info.get("description", "")
+        strengths = ", ".join(info.get("strengths", []))
+        agent_lines.append(f"  [{name}] {desc}")
+        agent_lines.append(f"       strengths: {strengths}")
+
+    planner_prompt = PLANNER_PROMPT.format(
+        profiles="\n".join(agent_lines),
+        task=args.task,
+    )
+
+    Path(base_dir).mkdir(parents=True, exist_ok=True)
+    print(f"[mew] planning with {planner}...", flush=True)
+    plan_result = run_agent(planner, planner_prompt, config, base_dir, args.timeout, args.yolo)
+
+    if plan_result["status"] != "completed":
+        print(f"[mew] planner failed: {plan_result['error']}", file=sys.stderr, flush=True)
+        return 1
+
+    plan = extract_json(plan_result["output"])
+    if not plan:
+        print("[mew] could not parse plan from planner output", file=sys.stderr, flush=True)
+        return 1
+
+    errors = []
+    for i, step in enumerate(plan):
+        if "agent" not in step or "task" not in step:
+            errors.append(f"  step {i+1}: missing 'agent' or 'task' key")
+        elif step["agent"] not in config:
+            errors.append(f"  step {i+1}: unknown agent '{step['agent']}'")
+    if errors:
+        for e in errors:
+            print(e, file=sys.stderr, flush=True)
+        return 1
+
+    print(f"[mew] plan: {len(plan)} steps", flush=True)
+    for i, step in enumerate(plan):
+        print(f"  {i+1}. [{step['agent']}] {step['task']}", flush=True)
+
+    if args.dry_run:
+        print("[mew] dry-run — skipping execution", flush=True)
+        return 0
+
+    results = plan_dispatch(plan, config, base_dir, args.timeout, args.yolo)
+    output = format_json(results) if args.json else format_results(results, mode="plan")
+    print(output, flush=True)
+    return 0
+
+
+@command
+def cmd_tui(args: argparse.Namespace, config: dict) -> int:
+    try:
+        from mewmew_orchestrator.tui import run_tui
+    except ImportError:
+        print(
+            "mew TUI requires textual.\n"
+            "Install with: pip install mewmew-orchestrator[tui]",
+            file=sys.stderr,
+        )
+        return 1
+    run_tui(config=config)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mew",
@@ -340,6 +513,15 @@ def build_parser() -> argparse.ArgumentParser:
     route_p = sub.add_parser("route", help="Find the best agent for a task")
     route_p.add_argument("task", type=str, help="Task description")
     route_p.add_argument("--agents", nargs="+", help="Candidates (default: all)")
+
+    plan_p = sub.add_parser("plan", help="Decompose task and dispatch sub-tasks to best-fit agents")
+    _shared_args(plan_p)
+    plan_p.add_argument("task", type=str, help="High-level task description")
+    plan_p.add_argument("--planner", type=str, default="opencode", help="Agent used to create the plan (default: opencode)")
+    plan_p.add_argument("--agents", nargs="+", help="Agents available for sub-tasks (default: all)")
+    plan_p.add_argument("--dry-run", action="store_true", help="Show plan without executing")
+
+    sub.add_parser("tui", help="Launch the terminal UI (textual)")
 
     return parser
 
