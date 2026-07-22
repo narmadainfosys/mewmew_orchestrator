@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mewmew-orchestrator"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-agent orchestrator for AI coding CLI agents (codex, opencode, agy, etc.)"
 readme = "README.md"
 license = { text = "MIT" }
