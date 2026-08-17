@@ -135,7 +135,9 @@ Use `--json` for machine-readable output.
 
 ## Why "mewmew"?
 
-Because orchestrating three AI agents at once is chaos. Mew.
+"mewmew" is my daughter's nickname — this project is named after her. 💛
+
+(It fits, too: orchestrating three AI agents at once is happy little chaos. Mew.)
 
 ## License
 
