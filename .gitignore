@@ -6,4 +6,5 @@ build/
 .mew/
 .venv/
 venv/
-
+graphify-out/
+.graphify_analysis.json
